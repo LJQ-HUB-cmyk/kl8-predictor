@@ -1,0 +1,1291 @@
+import os
+import csv
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+import xgboost as xgb
+from sklearn.preprocessing import StandardScaler
+import requests
+from bs4 import BeautifulSoup
+import json
+import time
+import random
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+from collections import Counter
+import warnings
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import log_loss
+
+# 配置参数
+warnings.filterwarnings('ignore')
+CSV_FILE = 'kl8_data.csv'
+SEQ_LEN = 30
+EMBED_DIM = 256
+BATCH_SIZE = 128
+EPOCHS = 100
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+LSTM_WEIGHTS = 'kl8_lstm_model.pt'
+TRANSFORMER_WEIGHTS = 'kl8_transformer_model.pt'
+XGB_MODEL_FILE = 'kl8_xgb_model.json'
+TEST_SIZE = 100  # 使用最后100期作为测试集
+MODEL_TRAINING = True  # 是否训练模型
+
+# 获取当前日期和时间
+NOW = datetime.now()
+TODAY = NOW.date()
+LAST_UPDATE_KEY = 'last_update_date'
+
+class DataFetcher:
+    """数据抓取类"""
+    def __init__(self):
+        self.base_urls = [
+            "https://www.500.com/kl8/kaijiang/",
+            "https://kaijiang.500.com/kl8.shtml",
+            "https://www.cwl.gov.cn/kl8/kjxx/kl8qh/"
+        ]
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+        }
+        self.data = []
+        
+    def fetch_500_com(self, start_date, end_date):
+        """从500彩票网抓取指定日期范围的数据"""
+        url = f"https://www.500.com/kl8/lishi/?s={start_date}&e={end_date}"
+        try:
+            response = requests.get(url, headers=self.headers, timeout=15)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # 解析表格数据
+            table = soup.find('table', class_='kj-tablelist')
+            if not table:
+                return False
+                
+            rows = table.find_all('tr')[1:]  # 跳过表头
+            new_data_count = 0
+            for row in rows:
+                cols = row.find_all('td')
+                if len(cols) < 22:  # 期号 + 日期 + 20个号码
+                    continue
+                    
+                issue = cols[0].text.strip()
+                date_str = cols[1].text.strip()
+                try:
+                    date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                except:
+                    continue
+                    
+                # 只添加今天之前的数据
+                if date >= TODAY:
+                    continue
+                    
+                numbers = []
+                for i in range(2, 22):
+                    num_text = cols[i].text.strip()
+                    if num_text.isdigit():
+                        numbers.append(int(num_text))
+                
+                if len(numbers) != 20:
+                    continue
+                    
+                # 添加开奖时间作为特征
+                draw_time = datetime.strptime(date_str, '%Y-%m-%d').timestamp()
+                self.data.append([issue, date_str, draw_time] + sorted(numbers))
+                new_data_count += 1
+                
+            print(f"从500彩票网抓取数据: {start_date} 至 {end_date}, 新增 {new_data_count} 期")
+            return True
+        except Exception as e:
+            print(f"抓取数据失败: {str(e)}")
+            return False
+    
+    def fetch_cwl_gov(self, year):
+        """从中国福彩网抓取指定年份的数据"""
+        url = f"https://www.cwl.gov.cn/kl8/kjxx/kl8qh/?year={year}"
+        try:
+            response = requests.get(url, headers=self.headers, timeout=15)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # 解析表格数据
+            table = soup.find('table', class_='kj-tj')
+            if not table:
+                return False
+                
+            rows = table.find_all('tr')[1:]  # 跳过表头
+            new_data_count = 0
+            for row in rows:
+                cols = row.find_all('td')
+                if len(cols) < 22:  # 期号 + 日期 + 20个号码
+                    continue
+                    
+                issue = cols[0].text.strip()
+                date_str = cols[1].text.strip()
+                try:
+                    date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                except:
+                    continue
+                    
+                # 只添加今天之前的数据
+                if date >= TODAY:
+                    continue
+                    
+                numbers = []
+                
+                # 提取开奖号码
+                for i in range(2, 22):
+                    num_text = cols[i].text.strip()
+                    if num_text.isdigit():
+                        numbers.append(int(num_text))
+                
+                if len(numbers) != 20:
+                    continue
+                    
+                # 添加开奖时间作为特征
+                draw_time = datetime.strptime(date_str, '%Y-%m-%d').timestamp()
+                self.data.append([issue, date_str, draw_time] + sorted(numbers))
+                new_data_count += 1
+                
+            print(f"从中国福彩网抓取{year}年数据: 新增 {new_data_count} 期")
+            return True
+        except Exception as e:
+            print(f"抓取{year}年数据失败: {str(e)}")
+            return False
+    
+    def fetch_recent_data(self, days=30):
+        """抓取最近N天的数据"""
+        print(f"抓取最近{days}天数据...")
+        end_date = (TODAY - timedelta(days=1)).strftime('%Y%m%d')  # 昨天
+        start_date = (TODAY - timedelta(days=days)).strftime('%Y%m%d')
+        return self.fetch_500_com(start_date, end_date)
+    
+    def fetch_all_data(self, start_year=2020, end_year=2025):
+        """抓取指定年份范围的数据"""
+        print(f"开始抓取{start_year}年-{end_year}年快乐8数据...")
+        
+        for year in range(start_year, end_year + 1):
+            # 尝试多个数据源
+            success = False
+            if year == 2024 or year == 2025:  # 最近年份使用500彩票网
+                start_date = f"{year}0101"
+                end_date = (TODAY - timedelta(days=1)).strftime('%Y%m%d')
+                if self.fetch_500_com(start_date, end_date):
+                    success = True
+            else:
+                if self.fetch_cwl_gov(year):
+                    success = True
+            
+            if not success:
+                print(f"{year}年数据抓取失败，将使用模拟数据补充")
+                self.generate_mock_data(year)
+                
+            # 避免请求过于频繁
+            time.sleep(1.5)
+        
+        # 保存数据到CSV
+        self.save_to_csv()
+        return len(self.data)
+    
+    def generate_mock_data(self, year, num_draws=150):
+        """生成模拟数据（当抓取失败时使用）"""
+        start_date = datetime(year, 1, 1).date()
+        
+        for i in range(num_draws):
+            # 确保日期不超过今天
+            draw_date = start_date + timedelta(days=i)
+            if draw_date >= TODAY:
+                break
+                
+            issue = f"{year}{str(i+1).zfill(4)}"
+            date_str = draw_date.strftime('%Y-%m-%d')
+            draw_time = datetime.combine(draw_date, datetime.min.time()).timestamp()
+            
+            # 生成20个不重复的随机号码
+            numbers = random.sample(range(1, 81), 20)
+            self.data.append([issue, date_str, draw_time] + sorted(numbers))
+        
+        print(f"生成{year}年模拟数据: {num_draws}期")
+    
+    def save_to_csv(self):
+        """保存数据到CSV文件"""
+        if not self.data:
+            print("无数据可保存")
+            return
+            
+        # 创建CSV头部
+        headers = ['issue', 'date', 'draw_time'] + [f'n{i}' for i in range(1, 21)]
+        
+        # 按日期排序
+        sorted_data = sorted(self.data, key=lambda x: x[2])
+        
+        with open(CSV_FILE, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+            writer.writerows(sorted_data)
+        
+        print(f"数据已保存至 {CSV_FILE}，共 {len(sorted_data)} 期")
+        
+        # 更新最后抓取日期
+        with open('update_info.json', 'w') as f:
+            json.dump({LAST_UPDATE_KEY: str(TODAY)}, f)
+
+class DataPreprocessor:
+    """数据预处理类"""
+    def __init__(self):
+        self.scaler = StandardScaler()
+        self.feature_names = []
+        
+    def load_data(self):
+        """加载CSV数据"""
+        if not os.path.exists(CSV_FILE):
+            print("数据文件不存在，请先抓取数据")
+            return None
+            
+        df = pd.read_csv(CSV_FILE)
+        
+        # 确保数据量足够
+        if len(df) < SEQ_LEN + TEST_SIZE + 10:
+            print(f"数据不足: {len(df)} 期，需要至少 {SEQ_LEN + TEST_SIZE + 10} 期")
+            return None
+            
+        # 转换日期列为日期类型
+        df['date'] = pd.to_datetime(df['date']).dt.date
+        
+        return df
+    
+    def create_one_hot(self, numbers):
+        """将号码列表转换为one-hot编码"""
+        one_hot = np.zeros(80)
+        for num in numbers:
+            if 1 <= num <= 80:
+                one_hot[num-1] = 1
+        return one_hot
+    
+    def create_features(self, df):
+        """创建特征数据集"""
+        # 只使用号码列
+        numbers_df = df[[f'n{i}' for i in range(1, 21)]]
+        
+        # 转换为one-hot编码序列
+        sequences = []
+        xgb_features = []
+        labels = []
+        
+        for i in range(SEQ_LEN, len(numbers_df)):
+            # 获取历史序列
+            seq = []
+            for j in range(i - SEQ_LEN, i):
+                numbers = numbers_df.iloc[j].values
+                one_hot = self.create_one_hot(numbers)
+                seq.append(one_hot)
+            
+            sequences.append(np.array(seq))
+            
+            # 当前期作为标签
+            current_numbers = numbers_df.iloc[i].values
+            labels.append(self.create_one_hot(current_numbers))
+            
+            # 创建XGBoost特征
+            flat_features = self.create_xgb_features(np.array(seq))
+            xgb_features.append(flat_features)
+        
+        sequences = np.array(sequences)
+        xgb_features = np.array(xgb_features)
+        labels = np.array(labels)
+        
+        return sequences, xgb_features, labels
+    
+    def create_xgb_features(self, history_seq):
+        """创建XGBoost特征"""
+        # 历史序列扁平化
+        flat_seq = history_seq.flatten()
+        
+        # 频率特征 (每个号码出现频率)
+        freq = history_seq.mean(axis=0)
+        
+        # 遗漏值特征 (每个号码最近一次出现距今的期数)
+        last_occurrence = np.zeros(80)
+        for k in range(80):
+            positions = np.where(history_seq[:, k] == 1)[0]
+            if positions.size > 0:
+                last_occurrence[k] = SEQ_LEN - positions[-1]
+        
+        # 组合特征
+        combined = np.concatenate([flat_seq, freq, last_occurrence])
+        
+        # 保存特征名称用于分析
+        if not self.feature_names:
+            self.feature_names = (
+                [f'hist_{i}_num_{j}' for i in range(SEQ_LEN) for j in range(80)] +
+                [f'freq_{i}' for i in range(80)] +
+                [f'last_occur_{i}' for i in range(80)]
+            )
+        
+        return combined
+    
+    def create_prediction_sequence(self, df):
+        """创建用于预测下一期的序列"""
+        numbers_df = df[[f'n{i}' for i in range(1, 21)]].tail(SEQ_LEN)
+        
+        # 创建序列
+        seq = []
+        for _, row in numbers_df.iterrows():
+            numbers = row.values
+            one_hot = self.create_one_hot(numbers)
+            seq.append(one_hot)
+        
+        sequence = np.array([seq])  # 形状为 (1, SEQ_LEN, 80)
+        
+        # 创建XGBoost特征
+        xgb_feature = self.create_xgb_features(np.array(seq))
+        xgb_feature = np.array([xgb_feature])  # 形状为 (1, 特征数)
+        
+        return sequence, xgb_feature
+
+class LotteryModel(nn.Module):
+    """彩票预测模型基类"""
+    def __init__(self, input_dim, output_dim=80):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(EMBED_DIM, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, output_dim)
+        )
+    
+    def forward(self, x):
+        return torch.sigmoid(self.fc(x))
+
+class LSTMModel(LotteryModel):
+    """LSTM模型"""
+    def __init__(self, input_dim):
+        super().__init__(input_dim)
+        self.lstm = nn.LSTM(
+            input_dim, 
+            EMBED_DIM, 
+            batch_first=True, 
+            num_layers=2, 
+            dropout=0.2
+        )
+    
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return super().forward(out[:, -1])
+
+class TransformerModel(LotteryModel):
+    """Transformer模型"""
+    def __init__(self, input_dim):
+        super().__init__(input_dim)
+        self.embedding = nn.Linear(input_dim, EMBED_DIM)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=EMBED_DIM, 
+            nhead=8,
+            dropout=0.2,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=3)
+    
+    def forward(self, x):
+        x = self.embedding(x)
+        out = self.transformer(x)
+        return super().forward(out[:, -1])
+
+class ModelManager:
+    """模型管理类"""
+    def __init__(self):
+        self.lstm_model = None
+        self.transformer_model = None
+        self.xgb_model = None
+        self.scaler = None
+        self.input_dim = None
+        self.val_loader = None
+        self.X_val_scaled = None
+        self.y_val = None
+        
+    def train_models(self, sequences, xgb_features, labels):
+        """训练所有模型"""
+        print("开始训练模型...")
+        
+        # 划分训练集和验证集
+        X_train, X_val, X_xgb_train, X_xgb_val, y_train, y_val = train_test_split(
+            sequences, xgb_features, labels, test_size=0.2, random_state=42
+        )
+        
+        # 训练LSTM模型
+        self.train_lstm(X_train, y_train, X_val, y_val)
+        
+        # 训练Transformer模型
+        self.train_transformer(X_train, y_train, X_val, y_val)
+        
+        # 训练XGBoost模型
+        self.train_xgboost(X_xgb_train, y_train, X_xgb_val, y_val)
+        
+        # 保存验证集用于动态权重计算
+        self.save_validation_data(X_val, X_xgb_val, y_val)
+        
+        # 保存模型
+        self.save_models()
+    
+    def save_validation_data(self, X_val, X_xgb_val, y_val):
+        """保存验证集用于动态权重计算"""
+        # 保存验证集
+        self.X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
+        self.y_val_tensor = torch.tensor(y_val, dtype=torch.float32)
+        
+        # 标准化XGB特征
+        if self.scaler is not None:
+            self.X_val_xgb_scaled = self.scaler.transform(X_xgb_val)
+        else:
+            self.X_val_xgb_scaled = X_xgb_val
+        
+        self.y_val_np = y_val
+        
+        # 创建验证集加载器
+        val_dataset = TensorDataset(self.X_val_tensor, self.y_val_tensor)
+        self.val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+        
+        print("验证集已保存用于动态权重计算")
+    
+    def train_lstm(self, X_train, y_train, X_val, y_val):
+        """训练LSTM模型"""
+        print("\n训练LSTM模型...")
+        self.input_dim = X_train.shape[2]
+        self.lstm_model = LSTMModel(self.input_dim).to(DEVICE)
+        
+        # 准备数据加载器
+        train_dataset = TensorDataset(
+            torch.tensor(X_train, dtype=torch.float32),
+            torch.tensor(y_train, dtype=torch.float32)
+        )
+        val_dataset = TensorDataset(
+            torch.tensor(X_val, dtype=torch.float32),
+            torch.tensor(y_val, dtype=torch.float32)
+        )
+        
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+        
+        # 定义优化器和损失函数
+        optimizer = torch.optim.Adam(self.lstm_model.parameters(), lr=0.001)
+        criterion = nn.BCELoss()
+        
+        best_val_loss = float('inf')
+        
+        for epoch in range(EPOCHS):
+            # 训练阶段
+            self.lstm_model.train()
+            train_loss = 0
+            for inputs, targets in train_loader:
+                inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
+                
+                optimizer.zero_grad()
+                outputs = self.lstm_model(inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+                
+                train_loss += loss.item()
+            
+            # 验证阶段
+            self.lstm_model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for inputs, targets in val_loader:
+                    inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
+                    outputs = self.lstm_model(inputs)
+                    loss = criterion(outputs, targets)
+                    val_loss += loss.item()
+            
+            train_loss /= len(train_loader)
+            val_loss /= len(val_loader)
+            
+            print(f'Epoch {epoch+1}/{EPOCHS} - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+            
+            # 保存最佳模型
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(self.lstm_model.state_dict(), LSTM_WEIGHTS)
+                print(f'保存LSTM模型: val_loss={val_loss:.4f}')
+        
+        print("LSTM模型训练完成")
+    
+    def train_transformer(self, X_train, y_train, X_val, y_val):
+        """训练Transformer模型"""
+        print("\n训练Transformer模型...")
+        self.input_dim = X_train.shape[2]
+        self.transformer_model = TransformerModel(self.input_dim).to(DEVICE)
+        
+        # 准备数据加载器
+        train_dataset = TensorDataset(
+            torch.tensor(X_train, dtype=torch.float32),
+            torch.tensor(y_train, dtype=torch.float32)
+        )
+        val_dataset = TensorDataset(
+            torch.tensor(X_val, dtype=torch.float32),
+            torch.tensor(y_val, dtype=torch.float32)
+        )
+        
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+        
+        # 定义优化器和损失函数
+        optimizer = torch.optim.Adam(self.transformer_model.parameters(), lr=0.0005)
+        criterion = nn.BCELoss()
+        
+        best_val_loss = float('inf')
+        
+        for epoch in range(EPOCHS):
+            # 训练阶段
+            self.transformer_model.train()
+            train_loss = 0
+            for inputs, targets in train_loader:
+                inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
+                
+                optimizer.zero_grad()
+                outputs = self.transformer_model(inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+                
+                train_loss += loss.item()
+            
+            # 验证阶段
+            self.transformer_model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for inputs, targets in val_loader:
+                    inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
+                    outputs = self.transformer_model(inputs)
+                    loss = criterion(outputs, targets)
+                    val_loss += loss.item()
+            
+            train_loss /= len(train_loader)
+            val_loss /= len(val_loader)
+            
+            print(f'Epoch {epoch+1}/{EPOCHS} - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+            
+            # 保存最佳模型
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(self.transformer_model.state_dict(), TRANSFORMER_WEIGHTS)
+                print(f'保存Transformer模型: val_loss={val_loss:.4f}')
+        
+        print("Transformer模型训练完成")
+    
+    def train_xgboost(self, X_train, y_train, X_val, y_val):
+        """训练XGBoost模型"""
+        print("\n训练XGBoost模型...")
+        
+        # 标准化特征
+        self.scaler = StandardScaler()
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_val_scaled = self.scaler.transform(X_val)
+        
+        # 创建DMatrix
+        dtrain = xgb.DMatrix(X_train_scaled, label=y_train)
+        dval = xgb.DMatrix(X_val_scaled, label=y_val)
+        
+        # 参数设置
+        params = {
+            'objective': 'binary:logistic',
+            'eval_metric': 'logloss',
+            'max_depth': 7,
+            'eta': 0.1,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'seed': 42
+        }
+        
+        # 训练模型
+        self.xgb_model = xgb.train(
+            params,
+            dtrain,
+            num_boost_round=1000,
+            evals=[(dval, 'eval')],
+            early_stopping_rounds=20,
+            verbose_eval=10
+        )
+        
+        print("XGBoost模型训练完成")
+    
+    def save_models(self):
+        """保存所有模型"""
+        if self.xgb_model is not None:
+            self.xgb_model.save_model(XGB_MODEL_FILE)
+            print(f"XGBoost模型已保存至 {XGB_MODEL_FILE}")
+        
+        # 保存缩放器
+        if self.scaler is not None:
+            np.save('scaler_params.npy', {
+                'mean': self.scaler.mean_,
+                'scale': self.scaler.scale_
+            })
+            print("缩放器参数已保存")
+        
+        # 保存验证数据
+        if hasattr(self, 'X_val_tensor') and hasattr(self, 'y_val_tensor'):
+            torch.save({
+                'X_val': self.X_val_tensor,
+                'y_val': self.y_val_tensor,
+                'X_val_xgb_scaled': self.X_val_xgb_scaled,
+                'y_val_np': self.y_val_np
+            }, 'validation_data.pt')
+            print("验证数据已保存")
+    
+    def load_models(self, input_dim):
+        """加载预训练模型"""
+        self.input_dim = input_dim
+        
+        # 加载LSTM模型
+        if os.path.exists(LSTM_WEIGHTS):
+            self.lstm_model = LSTMModel(input_dim).to(DEVICE)
+            self.lstm_model.load_state_dict(torch.load(LSTM_WEIGHTS, map_location=DEVICE))
+            self.lstm_model.eval()
+            print("LSTM模型加载成功")
+        else:
+            print("LSTM模型权重文件不存在")
+        
+        # 加载Transformer模型
+        if os.path.exists(TRANSFORMER_WEIGHTS):
+            self.transformer_model = TransformerModel(input_dim).to(DEVICE)
+            self.transformer_model.load_state_dict(torch.load(TRANSFORMER_WEIGHTS, map_location=DEVICE))
+            self.transformer_model.eval()
+            print("Transformer模型加载成功")
+        else:
+            print("Transformer模型权重文件不存在")
+        
+        # 加载XGBoost模型
+        if os.path.exists(XGB_MODEL_FILE):
+            self.xgb_model = xgb.Booster()
+            self.xgb_model.load_model(XGB_MODEL_FILE)
+            print("XGBoost模型加载成功")
+        else:
+            print("XGBoost模型文件不存在")
+        
+        # 加载缩放器
+        scaler_file = 'scaler_params.npy'
+        if os.path.exists(scaler_file):
+            scaler_params = np.load(scaler_file, allow_pickle=True).item()
+            self.scaler = StandardScaler()
+            self.scaler.mean_ = scaler_params['mean']
+            self.scaler.scale_ = scaler_params['scale']
+            print("缩放器加载成功")
+        else:
+            print("缩放器文件不存在")
+        
+        # 加载验证数据
+        if os.path.exists('validation_data.pt'):
+            val_data = torch.load('validation_data.pt', map_location='cpu')
+            self.X_val_tensor = val_data['X_val']
+            self.y_val_tensor = val_data['y_val']
+            self.X_val_xgb_scaled = val_data['X_val_xgb_scaled']
+            self.y_val_np = val_data['y_val_np']
+            
+            # 创建验证集加载器
+            val_dataset = TensorDataset(self.X_val_tensor, self.y_val_tensor)
+            self.val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+            print("验证数据加载成功")
+        else:
+            print("验证数据文件不存在")
+    
+    def evaluate_model(self, model, data_loader):
+        """评估模型性能"""
+        if model is None or data_loader is None:
+            return 0.1  # 默认值
+        
+        model.eval()
+        criterion = nn.BCELoss()
+        total_loss = 0
+        
+        with torch.no_grad():
+            for inputs, targets in data_loader:
+                inputs = inputs.to(DEVICE)
+                targets = targets.to(DEVICE)
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                total_loss += loss.item()
+        
+        return total_loss / len(data_loader)
+    
+    def evaluate_xgb(self, X_val, y_val):
+        """评估XGBoost模型性能"""
+        if self.xgb_model is None or X_val is None:
+            return 0.1  # 默认值
+        
+        dval = xgb.DMatrix(X_val, label=y_val)
+        preds = self.xgb_model.predict(dval)
+        return log_loss(y_val, preds)
+    
+    def predict(self, sequences, xgb_features):
+        """预测下一期号码 - 带动态权重调整"""
+        if self.lstm_model is None or self.transformer_model is None or self.xgb_model is None:
+            print("模型未加载，无法预测")
+            return None, {}
+        
+        # 准备数据
+        sequences_t = torch.tensor(sequences, dtype=torch.float32).to(DEVICE)
+        
+        # 标准化XGB特征
+        if self.scaler is not None:
+            xgb_features_scaled = self.scaler.transform(xgb_features)
+        else:
+            xgb_features_scaled = xgb_features
+        
+        # LSTM预测
+        self.lstm_model.eval()
+        with torch.no_grad():
+            lstm_pred = self.lstm_model(sequences_t).cpu().numpy()
+        
+        # Transformer预测
+        self.transformer_model.eval()
+        with torch.no_grad():
+            transformer_pred = self.transformer_model(sequences_t).cpu().numpy()
+        
+        # XGBoost预测
+        xgb_pred = self.xgb_model.predict(xgb.DMatrix(xgb_features_scaled))
+        
+        # 计算模型在验证集上的表现
+        lstm_val_loss = self.evaluate_model(self.lstm_model, self.val_loader)
+        transformer_val_loss = self.evaluate_model(self.transformer_model, self.val_loader)
+        xgb_val_loss = self.evaluate_xgb(self.X_val_xgb_scaled, self.y_val_np)
+        
+        print(f"模型验证损失: LSTM={lstm_val_loss:.4f}, Transformer={transformer_val_loss:.4f}, XGBoost={xgb_val_loss:.4f}")
+        
+        # 根据验证损失动态计算权重
+        total_loss = lstm_val_loss + transformer_val_loss + xgb_val_loss
+        lstm_weight = (1 - lstm_val_loss/total_loss) * 0.4
+        transformer_weight = (1 - transformer_val_loss/total_loss) * 0.35
+        xgb_weight = (1 - xgb_val_loss/total_loss) * 0.25
+        
+        # 归一化权重
+        total_weight = lstm_weight + transformer_weight + xgb_weight
+        lstm_weight /= total_weight
+        transformer_weight /= total_weight
+        xgb_weight /= total_weight
+        
+        print(f"动态权重: LSTM={lstm_weight:.2f}, Transformer={transformer_weight:.2f}, XGBoost={xgb_weight:.2f}")
+        
+        # 融合预测结果
+        ensemble_pred = (
+            lstm_weight * lstm_pred + 
+            transformer_weight * transformer_pred + 
+            xgb_weight * xgb_pred
+        )
+        
+        return ensemble_pred, {
+            "lstm": lstm_pred,
+            "transformer": transformer_pred,
+            "xgb": xgb_pred,
+            "weights": [lstm_weight, transformer_weight, xgb_weight]
+        }
+
+class PredictionAnalyzer:
+    """预测分析类"""
+    def __init__(self, df):
+        self.df = df
+        self.test_results = []
+    
+    def generate_predictions(self, model_manager, sequences, xgb_features, labels, test_mode=False):
+        """生成预测结果"""
+        predictions = []
+        
+        # 对测试集进行预测
+        for i in range(len(sequences)):
+            seq = sequences[i:i+1]
+            feat = xgb_features[i:i+1]
+            
+            pred, model_details = model_manager.predict(seq, feat)
+            if pred is None:
+                continue
+                
+            # 获取实际开奖号码
+            actual_numbers = np.where(labels[i] == 1)[0] + 1
+            
+            # 保存预测结果
+            pred_result = {
+                'issue': self.df.iloc[i + SEQ_LEN]['issue'],
+                'date': self.df.iloc[i + SEQ_LEN]['date'],
+                'prediction': pred[0],
+                'actual': actual_numbers,
+                'model_details': model_details
+            }
+            
+            predictions.append(pred_result)
+            
+            # 在测试模式下，每10期打印一次进度
+            if test_mode and (i % 10 == 0 or i == len(sequences) - 1):
+                print(f"已完成测试集预测: {i+1}/{len(sequences)}期")
+        
+        return predictions
+    
+    def analyze_test_results(self, predictions, test_size=TEST_SIZE):
+        """分析测试结果"""
+        # 确保有足够的测试数据
+        if len(predictions) < test_size:
+            test_size = len(predictions)
+            print(f"警告：测试集大小调整为{test_size}期")
+        
+        # 使用最后test_size期作为测试集
+        test_predictions = predictions[-test_size:]
+        
+        # 计算1-10码的命中率
+        hit_rates = {k: [] for k in range(1, 11)}
+        
+        for pred in test_predictions:
+            # 获取预测概率排序
+            sorted_indices = np.argsort(pred['prediction'])[::-1]
+            sorted_numbers = [idx + 1 for idx in sorted_indices]
+            
+            # 计算每个码数的命中个数
+            for k in range(1, 11):
+                predicted_k = sorted_numbers[:k]
+                hit_count = len(set(predicted_k) & set(pred['actual']))
+                hit_rates[k].append(hit_count)
+        
+        # 计算平均命中率和命中率
+        analysis_results = {}
+        for k in range(1, 11):
+            avg_hits = np.mean(hit_rates[k])
+            hit_rate = np.mean([1 if hits > 0 else 0 for hits in hit_rates[k]])
+            max_hits = np.max(hit_rates[k])
+            
+            analysis_results[k] = {
+                'avg_hits': avg_hits,
+                'hit_rate': hit_rate,
+                'max_hits': max_hits,
+                'hit_counts': hit_rates[k]
+            }
+        
+        return analysis_results
+    
+    def plot_hit_analysis(self, analysis_results):
+        """绘制命中分析图"""
+        # 准备数据
+        k_values = list(analysis_results.keys())
+        avg_hits = [results['avg_hits'] for results in analysis_results.values()]
+        hit_rates = [results['hit_rate'] * 100 for results in analysis_results.values()]
+        
+        # 创建图表
+        plt.figure(figsize=(12, 8))
+        
+        # 创建子图1：平均命中数
+        plt.subplot(2, 1, 1)
+        plt.bar(k_values, avg_hits, color='skyblue')
+        plt.title(f'快乐8 {TEST_SIZE}期回测分析 - 平均命中数 (1-10码玩法)')
+        plt.xlabel('预测码数')
+        plt.ylabel('平均命中数')
+        plt.xticks(k_values)
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        
+        # 添加数据标签
+        for i, v in enumerate(avg_hits):
+            plt.text(i+1-0.1, v+0.05, f'{v:.2f}', color='black', fontweight='bold')
+        
+        # 创建子图2：命中率
+        plt.subplot(2, 1, 2)
+        plt.bar(k_values, hit_rates, color='lightgreen')
+        plt.title('命中率分析')
+        plt.xlabel('预测码数')
+        plt.ylabel('命中率 (%)')
+        plt.xticks(k_values)
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        
+        # 添加数据标签
+        for i, v in enumerate(hit_rates):
+            plt.text(i+1-0.1, v+0.5, f'{v:.1f}%', color='black', fontweight='bold')
+        
+        plt.tight_layout()
+        plt.savefig('hit_analysis.png')
+        plt.close()
+        print("命中分析图已保存为 hit_analysis.png")
+    
+    def plot_number_distribution(self, predictions, top_n=20):
+        """绘制号码分布热力图"""
+        # 获取所有预测号码
+        all_preds = []
+        for pred in predictions:
+            sorted_indices = np.argsort(pred['prediction'])[::-1]
+            top_numbers = [idx + 1 for idx in sorted_indices[:top_n]]
+            all_preds.extend(top_numbers)
+        
+        # 统计号码出现频率
+        counter = Counter(all_preds)
+        
+        # 创建热力图数据
+        heatmap_data = np.zeros(80)
+        for num, count in counter.items():
+            if 1 <= num <= 80:
+                heatmap_data[num-1] = count
+        
+        # 归一化
+        heatmap_data = heatmap_data / np.max(heatmap_data)
+        
+        # 创建热力图
+        plt.figure(figsize=(15, 8))
+        plt.imshow(heatmap_data.reshape(8, 10), cmap='YlOrRd', interpolation='nearest')
+        plt.colorbar(label='相对频率')
+        plt.title(f'前{top_n}预测号码分布热力图 ({len(predictions)}期)')
+        plt.xlabel('号码十位')
+        plt.ylabel('号码个位')
+        
+        # 添加号码标签
+        for i in range(8):
+            for j in range(10):
+                num = i * 10 + j + 1
+                plt.text(j, i, f"{num}\n({counter.get(num, 0)})", 
+                         ha='center', va='center', color='black', fontsize=8)
+        
+        plt.tight_layout()
+        plt.savefig('number_distribution.png')
+        plt.close()
+        print("号码分布热力图已保存为 number_distribution.png")
+    
+    def generate_next_prediction_report(self, next_prediction, model_details, next_issue, next_date):
+        """生成下一期预测报告"""
+        # 获取预测的号码
+        sorted_indices = np.argsort(next_prediction)[::-1]
+        top_numbers = sorted_indices[:20] + 1  # 取前20个号码
+        
+        # 计算号码热度
+        hot_numbers, cold_numbers = self.calculate_hot_cold_numbers()
+        
+        # 生成报告
+        report = {
+            "预测时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "预测期号": next_issue,
+            "开奖日期": next_date.strftime("%Y-%m-%d"),
+            "模型权重": {
+                "LSTM": f"{model_details['weights'][0]:.2f}",
+                "Transformer": f"{model_details['weights'][1]:.2f}",
+                "XGBoost": f"{model_details['weights'][2]:.2f}"
+            },
+            "预测号码": [],
+            "1-10码推荐": {},
+            "热号分析": {
+                "最热号码": hot_numbers[:10],
+                "最冷号码": cold_numbers[:10]
+            }
+        }
+        
+        # 添加预测号码详情
+        for i, num in enumerate(top_numbers, 1):
+            report["预测号码"].append({
+                "排名": i,
+                "号码": num,
+                "预测概率": f"{next_prediction[sorted_indices[i-1]]:.4f}",
+                "热度": hot_numbers.index(num) + 1 if num in hot_numbers else 81
+            })
+        
+        # 生成1-10码推荐
+        for k in range(1, 11):
+            report["1-10码推荐"][k] = {
+                "推荐号码": sorted(top_numbers[:k]),
+                "平均概率": f"{np.mean(next_prediction[sorted_indices[:k]]):.4f}"
+            }
+        
+        return report
+    
+    def calculate_hot_numbers(self, lookback=100):
+        """计算热号"""
+        # 只取最近lookback期数据
+        if len(self.df) < lookback:
+            lookback = len(self.df)
+        recent_data = self.df.tail(lookback)
+        
+        # 统计所有号码出现次数
+        counter = Counter()
+        for _, row in recent_data.iterrows():
+            numbers = [row[f'n{i}'] for i in range(1, 21)]
+            counter.update(numbers)
+        
+        return counter
+    
+    def calculate_hot_cold_numbers(self, lookback=50):
+        """计算热号和冷号"""
+        # 只取最近lookback期数据
+        if len(self.df) < lookback:
+            lookback = len(self.df)
+        recent_data = self.df.tail(lookback)
+        
+        # 统计所有号码出现次数
+        counter = Counter()
+        for _, row in recent_data.iterrows():
+            numbers = [row[f'n{i}'] for i in range(1, 21)]
+            counter.update(numbers)
+        
+        # 按出现频率排序
+        hot_numbers = [num for num, count in counter.most_common()]
+        cold_numbers = [num for num, count in counter.most_common()[::-1]]
+        
+        return hot_numbers, cold_numbers
+
+def check_data_update_needed():
+    """检查数据是否需要更新"""
+    # 如果数据文件不存在，需要更新
+    if not os.path.exists(CSV_FILE):
+        print("数据文件不存在，需要更新")
+        return True
+    
+    # 检查最后更新日期
+    update_info_file = 'update_info.json'
+    if os.path.exists(update_info_file):
+        try:
+            with open(update_info_file, 'r') as f:
+                update_info = json.load(f)
+                last_update_date = datetime.strptime(update_info.get(LAST_UPDATE_KEY), '%Y-%m-%d').date()
+                if last_update_date == TODAY:
+                    print("今天已更新过数据，无需更新")
+                    return False
+        except:
+            pass
+    
+    # 检查数据文件中的最新日期
+    try:
+        df = pd.read_csv(CSV_FILE)
+        if 'date' in df.columns:
+            # 获取最新日期
+            df['date'] = pd.to_datetime(df['date']).dt.date
+            latest_date = df['date'].max()
+            
+            # 获取昨天的日期
+            yesterday = TODAY - timedelta(days=1)
+            
+            # 如果最新日期是昨天或更早，需要更新
+            if latest_date < yesterday:
+                print(f"数据需要更新，最新数据日期: {latest_date}, 当前日期: {TODAY}")
+                return True
+    except Exception as e:
+        print(f"检查数据更新时出错: {str(e)}")
+    
+    # 默认不需要更新
+    print("数据已是最新，无需更新")
+    return False
+
+def get_next_issue_info(df):
+    """获取下一期期号和开奖日期"""
+    # 获取最新一期的数据
+    last_row = df.iloc[-1]
+    last_issue = last_row['issue']
+    last_date = last_row['date']
+    
+    # 计算下一期的日期（通常是明天）
+    try:
+        # 尝试解析期号（假设期号是数字）
+        next_issue = str(int(last_issue) + 1)
+    except:
+        # 如果期号不是数字，使用日期生成
+        next_date = last_date + timedelta(days=1)
+        next_issue = next_date.strftime("%Y%m%d")
+    
+    # 计算下一期的开奖日期（通常是今天）
+    next_date = TODAY
+    
+    # 如果是开奖后运行，预测的是明天的开奖
+    current_hour = NOW.hour
+    if current_hour >= 21:  # 开奖时间后（21:30开奖）
+        next_date = TODAY + timedelta(days=1)
+    
+    return next_issue, next_date
+
+def main():
+    print(f"当前时间: {NOW.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"使用设备: {DEVICE}")
+    print("=" * 50)
+    
+    # 步骤1: 检查并更新数据
+    if check_data_update_needed():
+        print("开始更新数据...")
+        fetcher = DataFetcher()
+        
+        # 优先尝试抓取最近7天数据
+        if not fetcher.fetch_recent_data(days=7):
+            # 如果抓取最近数据失败，尝试抓取全年数据
+            current_year = TODAY.year
+            fetcher.fetch_all_data(current_year-1, current_year)
+        
+        # 如果仍然没有数据，使用模拟数据
+        if not fetcher.data:
+            print("无法获取真实数据，使用模拟数据")
+            fetcher.generate_mock_data(TODAY.year, num_draws=150)
+    
+    # 步骤2: 预处理数据
+    print("\n加载并预处理数据...")
+    preprocessor = DataPreprocessor()
+    df = preprocessor.load_data()
+    if df is None:
+        return
+    
+    print(f"加载 {len(df)} 期快乐8数据")
+    print(f"数据日期范围: {df['date'].min()} 至 {df['date'].max()}")
+    
+    # 获取下一期信息
+    next_issue, next_date = get_next_issue_info(df)
+    print(f"\n预测目标: 期号 {next_issue}, 开奖日期 {next_date}")
+    
+    # 步骤3: 创建特征
+    sequences, xgb_features, labels = preprocessor.create_features(df)
+    print(f"创建 {len(sequences)} 个样本，特征维度: {sequences.shape}")
+    
+    # 确保有足够的测试数据
+    test_start_index = max(0, len(sequences) - TEST_SIZE)
+    
+    # 步骤4: 模型训练或加载
+    model_manager = ModelManager()
+    
+    if MODEL_TRAINING:
+        # 训练模型
+        model_manager.train_models(sequences[:-TEST_SIZE], 
+                                  xgb_features[:-TEST_SIZE], 
+                                  labels[:-TEST_SIZE])
+    else:
+        # 加载预训练模型
+        print("\n加载预测模型...")
+        model_manager.load_models(sequences.shape[2])
+    
+    # 检查模型是否加载成功
+    if model_manager.lstm_model is None or model_manager.transformer_model is None or model_manager.xgb_model is None:
+        print("模型加载失败，无法进行预测")
+        return
+    
+    # 步骤5: 创建分析器
+    analyzer = PredictionAnalyzer(df)
+    
+    # 步骤6: 回测分析（可选）
+    run_backtest = input("\n是否运行回测分析? (y/n, 默认y): ").lower() != 'n'
+    if run_backtest:
+        print("\n开始回测分析...")
+        print(f"使用最近{TEST_SIZE}期作为测试集")
+        
+        # 获取测试集数据
+        test_sequences = sequences[test_start_index:]
+        test_xgb_features = xgb_features[test_start_index:]
+        test_labels = labels[test_start_index:]
+        
+        # 生成测试集预测
+        test_predictions = analyzer.generate_predictions(
+            model_manager, test_sequences, test_xgb_features, test_labels, test_mode=True
+        )
+        
+        # 分析回测结果
+        analysis_results = analyzer.analyze_test_results(test_predictions)
+        
+        # 打印回测结果
+        print("\n" + "=" * 50)
+        print(f"快乐8 {TEST_SIZE}期回测结果 (1-10码玩法)")
+        print("=" * 50)
+        print("预测码数 | 平均命中数 | 命中率(%) | 最大命中数")
+        print("-" * 50)
+        for k in range(1, 11):
+            result = analysis_results[k]
+            print(f"{k:2}码     | {result['avg_hits']:.2f}       | {result['hit_rate']*100:.1f}%     | {result['max_hits']}")
+        
+        # 绘制命中分析图
+        analyzer.plot_hit_analysis(analysis_results)
+        
+        # 绘制号码分布热力图
+        analyzer.plot_number_distribution(test_predictions)
+    
+    # 步骤7: 预测下一期
+    print("\n预测下一期开奖号码...")
+    
+    # 创建真正的下一期预测序列
+    next_sequence, next_xgb_feature = preprocessor.create_prediction_sequence(df)
+    
+    # 进行预测
+    next_prediction, model_details = model_manager.predict(next_sequence, next_xgb_feature)
+    
+    if next_prediction is None:
+        print("预测失败")
+        return
+    
+    # 生成预测报告
+    report = analyzer.generate_next_prediction_report(
+        next_prediction[0], 
+        model_details,
+        next_issue,
+        next_date
+    )
+    
+    # 打印预测报告
+    print("\n" + "=" * 70)
+    print(f"{'快乐8预测报告':^70}")
+    print("=" * 70)
+    print(f"预测期号: {report['预测期号']} | 开奖日期: {report['开奖日期']} | 预测时间: {report['预测时间']}")
+    print(f"模型权重: LSTM×{report['模型权重']['LSTM']} + Transformer×{report['模型权重']['Transformer']} + XGBoost×{report['模型权重']['XGBoost']}")
+    print("-" * 70)
+    
+    # 打印热号冷号分析
+    print("\n热号冷号分析:")
+    print(f"最热号码: {', '.join(map(str, report['热号分析']['最热号码'][:5]))}")
+    print(f"最冷号码: {', '.join(map(str, report['热号分析']['最冷号码'][:5]))}")
+    
+    # 打印推荐矩阵
+    print("\n推荐矩阵:")
+    print(f"{'玩法':<10} | {'推荐号码':<50} | {'平均概率'}")
+    print("-" * 70)
+    for k in [3, 5, 8, 10]:
+        rec = report["1-10码推荐"][k]
+        print(f"选{k}码    | {', '.join(map(str, rec['推荐号码'])):<50} | {rec['平均概率']}")
+    
+    # 打印完整预测排名
+    print("\n完整预测排名 (前20个):")
+    for num_info in report["预测号码"][:20]:
+        print(f"排名 {num_info['排名']:2d}: 号码 {num_info['号码']:2d} - 概率 {num_info['预测概率']} - 热度 {num_info['热度']}")
+    
+    # 最佳投资建议
+    print("\n" + "=" * 70)
+    print("最佳投资策略推荐:")
+    print("1. 选5码玩法: 平衡中奖率与回报率")
+    print(f"   推荐号码: {', '.join(map(str, report['1-10码推荐'][5]['推荐号码']))}")
+    print("2. 选3码玩法: 高命中率保守策略")
+    print(f"   推荐号码: {', '.join(map(str, report['1-10码推荐'][3]['推荐号码']))}")
+    print("3. 选10码玩法: 冲击大奖策略")
+    print(f"   推荐号码: {', '.join(map(str, report['1-10码推荐'][10]['推荐号码']))}")
+    
+    # 投注时间建议
+    current_hour = NOW.hour
+    if current_hour < 18:
+        print("\n建议投注时间: 18:00-21:00 (开奖前)")
+    elif current_hour < 21:
+        print("\n建议投注时间: 立即投注 (离开奖时间较近)")
+    else:
+        print("\n今日开奖已结束，请明日再投注")
+    
+    # 风险提示
+    print("\n" + "=" * 70)
+    print("重要提示:")
+    print("1. 彩票预测仅供参考，实际开奖具有随机性")
+    print("2. 理性购彩，建议单期投入不超过20元")
+    print(f"3. 开奖时间: {next_date.strftime('%Y-%m-%d')} 21:30 (中国福彩网)")
+    print("=" * 70)
+    
+    # 保存预测结果
+    save_prediction = input("\n是否保存预测结果? (y/n, 默认y): ").lower() != 'n'
+    if save_prediction:
+        filename = f"prediction_{next_issue}.txt"
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(f"快乐8第 {next_issue} 期预测报告\n")
+            f.write(f"开奖日期: {next_date}\n")
+            f.write(f"预测时间: {report['预测时间']}\n\n")
+            f.write("模型权重:\n")
+            f.write(f"  LSTM: {report['模型权重']['LSTM']}\n")
+            f.write(f"  Transformer: {report['模型权重']['Transformer']}\n")
+            f.write(f"  XGBoost: {report['模型权重']['XGBoost']}\n\n")
+            f.write("推荐号码:\n")
+            for k in [3, 5, 8, 10]:
+                rec = report["1-10码推荐"][k]
+                f.write(f"选{k}码: {', '.join(map(str, rec['推荐号码']))}\n")
+            f.write("\n完整预测排名:\n")
+            for num_info in report["预测号码"]:
+                f.write(f"排名 {num_info['排名']:2d}: 号码 {num_info['号码']:2d} - 概率 {num_info['预测概率']} - 热度 {num_info['热度']}\n")
+        print(f"预测结果已保存至 {filename}")
+
+if __name__ == "__main__":
+    main()
